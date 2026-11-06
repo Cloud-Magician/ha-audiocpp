@@ -3,14 +3,17 @@
 import asyncio
 from collections.abc import AsyncGenerator
 import io
+import itertools
 import shutil
+from urllib.parse import urlsplit
 import wave
 
 from aiohttp.test_utils import TestServer
 import pytest
 
-from custom_components.audiocpp.api import normalize_url
+from custom_components.audiocpp.api import AudioCppConnectionError, normalize_url
 from custom_components.audiocpp.const import DOMAIN
+from custom_components.audiocpp.diagnostics import async_get_config_entry_diagnostics
 from custom_components.audiocpp.tests.fake_server import (
     PARAMS,
     SAMPLE_RATE,
@@ -24,7 +27,11 @@ from homeassistant.config_entries import ConfigEntryState, ConfigSubentry
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er, issue_registry as ir
+from homeassistant.helpers import (
+    device_registry as dr,
+    entity_registry as er,
+    issue_registry as ir,
+)
 from homeassistant.setup import async_setup_component
 
 
@@ -70,7 +77,7 @@ async def _add_engine(hass, entry, kind: str, model: str, settings: dict):
     ]
     expected = {
         "tts": ["kitt-en", "kokoro", "chatterbox-italian"],
-        "stt": ["nemotron-stream", "parakeet"],
+        "stt": ["nemotron-stream", "parakeet", "nemotron-transcribe"],
     }
     assert listed == expected[kind]
     result = await hass.config_entries.subentries.async_configure(
@@ -82,6 +89,17 @@ async def _add_engine(hass, entry, kind: str, model: str, settings: dict):
     )
     await hass.async_block_till_done()
     return result
+
+
+async def _settings_schema(hass, entry, kind: str, model: str) -> dict:
+    """Open a new engine's settings step for ``model``; return its schema."""
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, kind), context={"source": "user"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"model": model}
+    )
+    return result["data_schema"].schema
 
 
 def _entity(hass, domain_component, platform: str, subentry_id: str):
@@ -509,13 +527,8 @@ async def test_speed_field_follows_model(hass: HomeAssistant, fake) -> None:
     entry = await _add_server(hass, url)
 
     async def settings_fields(model: str) -> dict:
-        result = await hass.config_entries.subentries.async_init(
-            (entry.entry_id, "tts"), context={"source": "user"}
-        )
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"], {"model": model}
-        )
-        return {str(key): value for key, value in result["data_schema"].schema.items()}
+        schema = await _settings_schema(hass, entry, "tts", model)
+        return {str(key): value for key, value in schema.items()}
 
     def bounds(selector) -> tuple:
         return selector.config["min"], selector.config["max"]
@@ -675,6 +688,74 @@ async def test_top_level_instruct(hass: HomeAssistant, fake) -> None:
     )
 
 
+async def test_instruction_field(hass: HomeAssistant, fake) -> None:
+    """Test the instruction field for models that declare an instruction."""
+    server, url = fake
+    entry = await _add_server(hass, url)
+
+    async def settings_fields(model: str) -> set[str]:
+        return {str(key) for key in await _settings_schema(hass, entry, "tts", model)}
+
+    # Pocket TTS declares `instruct` here; Kokoro declares nothing like it.
+    assert "instruction" in await settings_fields("kitt-en")
+    assert "instruction" not in await settings_fields("kokoro")
+
+    result = await _add_engine(
+        hass,
+        entry,
+        "tts",
+        "kitt-en",
+        {
+            "name": "KITT",
+            "languages": ["en"],
+            "split_sentences": True,
+            "instruction": "a calm, low voice",
+            "extra_options": {"options": {"seed": 3}},
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY, result
+    sub = _subentry(entry, "tts")
+    assert sub.data["instruction_option"] == "instruct"
+    assert sub.data["extra_options"] == {"options": {"seed": 3}}
+    # The probe and every request carry it among the model's options.
+    expected = {"seed": 3, "instruct": "a calm, low voice"}
+    assert server.speech_requests[-1]["options"] == expected
+    entity = _entity(hass, tts.DATA_COMPONENT, "tts", sub.subentry_id)
+    await entity.async_get_tts_audio("Hi there.", "en", {})
+    assert server.speech_requests[-1]["options"] == expected
+
+    # A server that no longer describes options (before v0.9.1): the stored
+    # option name keeps the field, also when the form comes back with an error.
+    server.params = None
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "tts"),
+        context={"source": "reconfigure", "subentry_id": sub.subentry_id},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"model": "kitt-en"}
+    )
+    settings = {
+        "name": "KITT",
+        "languages": ["en"],
+        "split_sentences": True,
+        "instruction": "a calm, low voice",
+    }
+    # kitt-en rejects speed, so the test synthesis fails.
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {**settings, "speed": 1.5}
+    )
+    assert result["errors"] == {"base": "probe_failed"}
+    assert "instruction" in {str(key) for key in result["data_schema"].schema}
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], settings
+    )
+    assert result["type"] is FlowResultType.ABORT, result
+    await hass.async_block_till_done()
+    sub = _subentry(entry, "tts")
+    assert sub.data["instruction"] == "a calm, low voice"
+    assert sub.data["instruction_option"] == "instruct"
+
+
 async def test_repair_issue_for_stale_options(hass: HomeAssistant, fake) -> None:
     """Test the repair issue for options the server no longer accepts."""
     server, url = fake
@@ -707,6 +788,7 @@ async def test_repair_issue_for_stale_options(hass: HomeAssistant, fake) -> None
     await reload()
     issue = issues.async_get_issue(DOMAIN, issue_id)
     assert issue is not None and issue.translation_key == "engine_options"
+    assert issue.config_entry_id == entry.entry_id
     assert issue.translation_placeholders["engine"] == "Kokoro"
     assert issue.translation_placeholders["problems"] == (
         "kokoro has no speed control; `seed` is not an option of kokoro"
@@ -726,6 +808,140 @@ async def test_repair_issue_for_stale_options(hass: HomeAssistant, fake) -> None
     hass.config_entries.async_remove_subentry(entry, sub.subentry_id)
     await hass.async_block_till_done()
     assert issues.async_get_issue(DOMAIN, issue_id) is None
+
+    # An issue raised before 0.4.0 was not linked to the entry; the next
+    # setup removes it all the same.
+    legacy_id = f"engine_options_{entry.entry_id}_gone"
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        legacy_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="engine_options",
+    )
+    await reload()
+    assert issues.async_get_issue(DOMAIN, legacy_id) is None
+
+
+async def test_repair_issue_removed_with_entry(hass: HomeAssistant, fake) -> None:
+    """Test that Home Assistant removes the engines' issues with the server."""
+    server, url = fake
+    entry = await _add_server(hass, url)
+    await _add_engine(
+        hass,
+        entry,
+        "tts",
+        "kokoro",
+        {"name": "Kokoro", "languages": ["en"], "split_sentences": True, "speed": 1.5},
+    )
+    sub = _subentry(entry, "tts")
+    server.params["kokoro"] = []
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    issue_id = f"engine_options_{entry.entry_id}_{sub.subentry_id}"
+    issues = ir.async_get(hass)
+    assert issues.async_get_issue(DOMAIN, issue_id) is not None
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert issues.async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_busy_server_retries_later(
+    hass: HomeAssistant, fake, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test a longer setup retry while the server answers 503."""
+    server, url = fake
+    entry = await _add_server(hass, url)
+    server.busy = True
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert "Retrying in 60 seconds" in caplog.text
+
+
+async def test_server_version_and_diagnostics(hass: HomeAssistant, fake) -> None:
+    """Test the server build on the device page and in diagnostics."""
+    _, url = fake
+    entry = await _add_server(hass, url)
+    await _add_engine(
+        hass, entry, "stt", "parakeet", {"name": "Parakeet", "languages": ["en"]}
+    )
+    sub = _subentry(entry, "stt")
+    device = dr.async_get(hass).async_get_device_by_identifier(
+        (DOMAIN, sub.subentry_id), entry.entry_id
+    )
+    assert device is not None and device.sw_version == "0.9.4 (1bbd8517)"
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    assert diagnostics["entry"]["url"] == "**REDACTED**"
+    assert diagnostics["server_version"] == "0.9.4 (1bbd8517)"
+    assert diagnostics["server"]["health"]["git_date"] == "2026-11-01"
+    model = next(m for m in diagnostics["server"]["models"] if m["id"] == "parakeet")
+    assert model["device"] == 0 and model["configured"] is True
+    assert diagnostics["engines"] == [
+        {"type": "stt", "title": "Parakeet", "data": dict(sub.data)}
+    ]
+
+
+async def test_diagnostics_error_hides_server(
+    hass: HomeAssistant, fake, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that a failed server call names neither the URL nor the host."""
+    _, url = fake
+    entry = await _add_server(hass, url)
+    client = entry.runtime_data
+    host = urlsplit(client.url).hostname
+    assert host
+
+    async def unreachable() -> dict:
+        # The client's message, around aiohttp's, which names the host.
+        raise AudioCppConnectionError(
+            f"Error talking to audio.cpp at {client.url}: "
+            f"Cannot connect to host {host}:1 ssl:default"
+        )
+
+    monkeypatch.setattr(client, "health", unreachable)
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    error = diagnostics["server"]["error"]
+    assert client.url not in error and host not in error
+    assert error == (
+        "Error talking to audio.cpp at **REDACTED**: "
+        "Cannot connect to host **REDACTED**:1 ssl:default"
+    )
+
+
+async def test_diagnostics_not_loaded(hass: HomeAssistant, fake) -> None:
+    """Test diagnostics of an entry waiting to retry, and redacted options."""
+    server, url = fake
+    entry = await _add_server(hass, url)
+    result = await _add_engine(
+        hass,
+        entry,
+        "tts",
+        "kokoro",
+        {
+            "name": "Kokoro",
+            "languages": ["en"],
+            "split_sentences": True,
+            "extra_options": {"seed": 7},
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY, result
+    server.busy = True
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+
+    requests = len(server.auth_headers)
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    assert len(server.auth_headers) == requests
+    assert diagnostics["server"] == {"error": "not loaded"}
+    assert diagnostics["server_version"] is None
+    assert diagnostics["entry"]["url"] == "**REDACTED**"
+    (engine,) = diagnostics["engines"]
+    assert engine["data"]["model"] == "kokoro"
+    assert engine["data"]["extra_options"] == "**REDACTED**"
 
 
 async def test_stt_live_and_file(hass: HomeAssistant, fake) -> None:
@@ -761,8 +977,21 @@ async def test_stt_live_and_file(hass: HomeAssistant, fake) -> None:
         for _ in range(5):
             yield b"\x01\x00" * 160
 
-    result = await entity.async_process_audio_stream(metadata, mic())
-    assert result == stt.SpeechResult("live 1600 bytes", stt.SpeechResultState.SUCCESS)
+    results = [
+        result
+        async for result in entity.internal_async_process_audio_stream_with_progress(
+            metadata, mic()
+        )
+    ]
+    # The transcript so far while the audio streams, then the final text.
+    *partials, final = results
+    assert final == stt.SpeechResult("live 1600 bytes", stt.SpeechResultState.SUCCESS)
+    assert partials and all(isinstance(p, stt.PartialSpeechResult) for p in partials)
+    texts = [p.text for p in partials]
+    assert all(b.startswith(a) for a, b in itertools.pairwise(texts))
+    # The fake's whitespace-only deltas repeat no partial.
+    assert all(a != b for a, b in itertools.pairwise(texts))
+    assert texts[-1].count("[") == len(texts)
     (live,) = server.live
     assert live["model"] == "nemotron-stream" and live["sample_rate"] == "16000"
     assert live["language"] == "en-US" and live["prompt"] == "KITT, Michael"
@@ -787,7 +1016,7 @@ async def test_stt_live_and_file(hass: HomeAssistant, fake) -> None:
     assert "translation_domain" not in result
     await hass.async_block_till_done()
     entity = _entity(hass, stt.DATA_COMPONENT, "stt", sub.subentry_id)
-    result = await entity.async_process_audio_stream(metadata, mic())
+    result = await entity.internal_async_process_audio_stream(metadata, mic())
     assert result == stt.SpeechResult("heard 800 frames", stt.SpeechResultState.SUCCESS)
     (upload,) = server.transcriptions
     assert upload == {
@@ -798,6 +1027,21 @@ async def test_stt_live_and_file(hass: HomeAssistant, fake) -> None:
         "frames": 800,
         "rate": 16000,
     }
+
+
+async def test_language_hint_suggested_for_nemotron_transcribe(
+    hass: HomeAssistant, fake
+) -> None:
+    """Test that Nemotron Transcribe gets the language code by default."""
+    _, url = fake
+    entry = await _add_server(hass, url)
+
+    async def hint_default(model: str) -> str:
+        schema = await _settings_schema(hass, entry, "stt", model)
+        return next(k for k in schema if k == "language_hint").default()
+
+    assert await hint_default("nemotron-transcribe") == "code"
+    assert await hint_default("parakeet") == "none"
 
 
 async def test_tts_through_home_assistant(hass: HomeAssistant, fake) -> None:
