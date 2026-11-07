@@ -7,8 +7,9 @@ option renamed by a server upgrade (v0.9.2 renamed many) when the engine is
 saved or set up, instead of when Assist next speaks.
 """
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 import difflib
+import math
 from typing import Any
 
 from .api import RESERVED_SPEECH_KEYS, ModelInfo, ModelParam
@@ -136,3 +137,103 @@ def check_speech_options(
                 f"{model.id}{_suggest(key, model)}"
             )
     return [problem for problem in problems if problem]
+
+
+# Spec types a call may set: plain values. Path types (``path``,
+# ``audio_path``, ``path_list``, ...) and lists are never offered.
+_SCALAR_TYPES = frozenset({"int", "float", "bool", "string", "enum"})
+# Declared options the integration sets itself, with where to set them instead.
+_MANAGED = {
+    "speed": "set the speed in the engine's settings",
+    "speaking_rate": "set the speed in the engine's settings",
+    "language": "use the language of the action call",
+}
+_TRUE = frozenset({"true", "on", "yes", "1"})
+_FALSE = frozenset({"false", "off", "no", "0"})
+
+
+def call_option_choices(model: ModelInfo) -> list[ModelParam]:
+    """Return the declared options an engine may let ``tts.speak`` calls set.
+
+    Only plain-valued options the integration does not manage itself. The
+    owner still picks which of them calls may set (``CONF_CALL_OPTIONS``):
+    the spec's type does not say whether a ``string`` option names a file on
+    the server (``voice_samples``, ``previous_takes_file``, JSON with an
+    ``audio_path``), so nothing is allowed by default.
+    """
+    return [
+        param
+        for param in model.params or ()
+        if param.type in _SCALAR_TYPES and param.name not in _MANAGED
+    ]
+
+
+def call_option_names(model: ModelInfo, allowed: Collection[str]) -> list[str]:
+    """Return the options a ``tts.speak`` call may name, in the model's order.
+
+    These are the engine's allowed options that the model still declares
+    with a plain type. Home Assistant refuses any other option before the
+    engine is called.
+    """
+    return [param.name for param in call_option_choices(model) if param.name in allowed]
+
+
+def _coerce(value: Any, param: ModelParam) -> Any:
+    """Convert a call's value to the option's declared type, or raise ValueError."""
+    name = param.name
+    if param.type == "int":
+        if isinstance(value, bool):
+            raise ValueError(f"`{name}` must be a whole number")
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        try:
+            return int(value)
+        except TypeError, ValueError:
+            raise ValueError(f"`{name}` must be a whole number") from None
+    if param.type == "float":
+        if isinstance(value, bool):
+            raise ValueError(f"`{name}` must be a number")
+        try:
+            number = float(value)
+        except TypeError, ValueError:
+            raise ValueError(f"`{name}` must be a number") from None
+        if not math.isfinite(number):
+            raise ValueError(f"`{name}` must be a number")
+        return number
+    if param.type == "bool":
+        if isinstance(value, bool):
+            return value
+        if str(value).lower() in _TRUE:
+            return True
+        if str(value).lower() in _FALSE:
+            return False
+        raise ValueError(f"`{name}` must be true or false")
+    return str(value)
+
+
+def call_options(
+    model: ModelInfo, options: Mapping[str, Any], allowed: Collection[str]
+) -> dict[str, Any]:
+    """Return the model options a ``tts.speak`` call sets, converted and checked.
+
+    Only the options :func:`call_option_names` returns are taken; other keys
+    (``voice``, Home Assistant's ``preferred_*``) are not this function's
+    business and are skipped. An empty value is skipped too, so a script can
+    leave a field unset. Raises ValueError with a message for the caller on
+    an invalid value.
+    """
+    names = set(call_option_names(model, allowed))
+    chosen: dict[str, Any] = {}
+    for name, value in options.items():
+        if (
+            name not in names
+            or (param := model.param(name)) is None
+            or value is None
+            or value == ""
+        ):
+            continue
+        value = _coerce(value, param)
+        if problem := _check_value(name, value, param):
+            raise ValueError(problem)
+        chosen[name] = value
+    return chosen

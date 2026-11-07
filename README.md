@@ -44,12 +44,37 @@ Copy `custom_components/audiocpp` into your Home Assistant `config/custom_compon
 | Speed | Speech rate multiplier. Only shown for models with speed control (clone models included), limited to the range the model declares. |
 | Instruction | How the model should speak, for example "a calm, low male voice". Only shown for models that declare an `instruct` or `instruction` option, such as Qwen3-TTS or VoxCPM2 voice design. |
 | Extra request options | Extra fields sent with every speech request, such as `seed` or an `options` object with model options. Settings that belong to one voice can also go in its voice preset in the server's `server.json` (audio.cpp v0.9.2 and later), which then applies to every client. |
+| Options a call may set | Model options that `tts.speak` calls may set per call (see below). Empty by default, so a call can set only the voice. |
 
 Saving a TTS engine first checks the speed, instruction and extra request options against the options the server says the model takes (audio.cpp v0.9.1 or newer). A typo or a renamed option is flagged with a suggestion, for example "`guidance` is not an option of omnivoice; did you mean `guidance_scale`?". If you know the model takes it anyway, save again without changes to keep it.
 
 It then runs a short test synthesis ("Hello."). This catches settings the model rejects, and records the sample rate that the streaming endpoint doesn't report. The test can take a while if the server first has to load the model.
 
 With a server older than v0.9.1, the speed field is always shown and only the test synthesis checks the settings.
+
+### Setting model options per call
+
+The extra request options are fixed for an engine. To change a model option from one `tts.speak` call to the next, first pick it in the engine's **Options a call may set**, then pass it in the action's `options`, next to `voice`:
+
+```yaml
+action: tts.speak
+target:
+  entity_id: tts.breeze
+data:
+  media_player_entity_id: media_player.kitchen
+  message: "The oven is ready."
+  options:
+    voice: Maia.wav
+    instruct: Say it warmly, with a light smile.
+    guidance_scale: 2
+    seed: 5
+```
+
+This works for anything that calls the `tts.speak` action: scripts, automations, and programs using Home Assistant's API. The voice assistant (Assist) passes the engine only its pipeline's voice, so Assist replies keep using the engine's extra request options.
+
+The setting lists the request options the model's spec declares with a plain value (whole number, number, true/false, text or a choice), such as `seed`, `temperature`, `guidance_scale` or `instruct`. Options of a file type, and `speed` (an engine setting) and `language` (the language of the call), are never offered. **Nothing is allowed by default.** Pick only options you want every Home Assistant user to control: some models declare options that name files on the server as plain text (for example `voice_samples` in MOSS-TTSD and VibeVoice), and a caller could then point the server at any file it can read.
+
+Values from a template or a text field arrive as text and are converted to the declared type, then checked against the minimum, maximum and allowed values the spec gives; an empty value is ignored, so a script can leave a field unset. A value in the call wins over the same option in the engine's extra request options. A value the model does not accept fails the action with a message that says what is wrong, for example "`seed` must be at least 0", before anything is sent to the server. An option that isn't allowed fails with Home Assistant's own "unsupported options" error. The list is read when the engine loads, so a call made in the first moments after Home Assistant starts may still see only `voice`. With a server older than v0.9.1, which does not list options, only `voice` is accepted.
 
 ### STT engine settings
 

@@ -16,11 +16,12 @@ from homeassistant.components.tts import (
 )
 from homeassistant.config_entries import ConfigSubentry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .api import AudioCppError, PcmFormat, build_wav, wav_header
+from .api import AudioCppError, ModelInfo, PcmFormat, build_wav, wav_header
 from .const import (
+    CONF_CALL_OPTIONS,
     CONF_CHANNELS,
     CONF_LANGUAGES,
     CONF_SAMPLE_RATE,
@@ -31,7 +32,7 @@ from .const import (
     SUBENTRY_TTS,
 )
 from .entity import AudioCppEntity
-from .options import speech_extra
+from .options import call_option_names, call_options, speech_extra
 
 if TYPE_CHECKING:
     from . import AudioCppConfigEntry
@@ -122,6 +123,11 @@ class AudioCppTTSEntity(TextToSpeechEntity, AudioCppEntity):
         self._attr_default_language = languages[0]
         self._attr_default_options = {ATTR_VOICE: self._voice} if self._voice else None
         self._voices: list[Voice] = []
+        self._model_info: ModelInfo | None = None
+        # Model options the owner lets tts.speak calls set; none by default.
+        self._call_allowed: frozenset[str] = frozenset(
+            data.get(CONF_CALL_OPTIONS) or ()
+        )
 
     @override
     async def async_added_to_hass(self) -> None:
@@ -136,6 +142,33 @@ class AudioCppTTSEntity(TextToSpeechEntity, AudioCppEntity):
         self.entry.async_create_background_task(
             self.hass, self._async_load_voices(), f"audiocpp voices {self.model}"
         )
+        self.entry.async_create_background_task(
+            self.hass, self._async_load_options(), f"audiocpp options {self.model}"
+        )
+
+    async def _async_load_options(self) -> None:
+        """Learn which allowed options the model declares, so a call can set them.
+
+        Home Assistant checks a call's options against ``supported_options``
+        when it runs, so the list grows once this has loaded. With no allowed
+        options, or a server before audio.cpp v0.9.1 (which declares none),
+        only ``voice`` is accepted.
+        """
+        if not self._call_allowed:
+            return
+        try:
+            models = await self.client.models()
+        except AudioCppError as err:
+            _LOGGER.debug("Could not list options for %s: %s", self.model, err)
+            return
+        model = next((m for m in models if m.id == self.model), None)
+        if model is None or model.params is None:
+            return
+        self._model_info = model
+        self._attr_supported_options = [
+            ATTR_VOICE,
+            *call_option_names(model, self._call_allowed),
+        ]
 
     async def _async_load_voices(self) -> None:
         try:
@@ -151,8 +184,29 @@ class AudioCppTTSEntity(TextToSpeechEntity, AudioCppEntity):
         """Return the voices and presets the server offers for this model."""
         return self._voices or None
 
+    def _extra_for(self, options: dict[str, Any]) -> dict[str, Any]:
+        """Return the engine's extra options with this call's model options merged in.
+
+        Called before synthesis starts, so a refused value fails the action
+        call itself rather than a stream that is already running. A value from
+        the call wins over the same option in the engine's extra options.
+        """
+        if self._model_info is None:
+            return self._extra
+        try:
+            per_call = call_options(self._model_info, options, self._call_allowed)
+        except ValueError as err:
+            raise ServiceValidationError(f"audio.cpp {self.model}: {err}") from err
+        if not per_call:
+            return self._extra
+        merged = {**(self._extra.get("options") or {}), **per_call}
+        return {**self._extra, "options": merged}
+
     async def _pcm(
-        self, texts: AsyncIterable[str], options: dict[str, Any]
+        self,
+        texts: AsyncIterable[str],
+        options: dict[str, Any],
+        extra: dict[str, Any],
     ) -> AsyncGenerator[tuple[PcmFormat, bytes]]:
         """Synthesize each text in turn, yielding PCM with its format."""
         voice = options.get(ATTR_VOICE) or self._voice
@@ -175,7 +229,7 @@ class AudioCppTTSEntity(TextToSpeechEntity, AudioCppEntity):
                             text,
                             voice=voice,
                             speed=self._speed,
-                            extra=self._extra,
+                            extra=extra,
                         )
                     ) as stream:
                         async for pcm in stream:
@@ -186,7 +240,7 @@ class AudioCppTTSEntity(TextToSpeechEntity, AudioCppEntity):
                     text,
                     voice=voice,
                     speed=self._speed,
-                    extra=self._extra,
+                    extra=extra,
                 )
                 # Sentences are joined into one WAV, so they must agree.
                 if first_format is None:
@@ -219,11 +273,12 @@ class AudioCppTTSEntity(TextToSpeechEntity, AudioCppEntity):
         reply is spoken sentence by sentence while the LLM is still writing.
         """
         options = request.options or {}
+        extra = self._extra_for(options)
 
         async def data_gen() -> AsyncGenerator[bytes]:
             header_sent = False
             async with aclosing(
-                self._pcm(self._texts(request.message_gen), options)
+                self._pcm(self._texts(request.message_gen), options, extra)
             ) as chunks:
                 async for fmt, pcm in chunks:
                     if not header_sent:
@@ -240,10 +295,11 @@ class AudioCppTTSEntity(TextToSpeechEntity, AudioCppEntity):
         self, message: str, language: str, options: dict[str, Any]
     ) -> TtsAudioType:
         """Synthesize a whole message into a complete WAV file."""
+        extra = self._extra_for(options)
         texts = iter_sentences(_single(message)) if self._split else _single(message)
         fmt: PcmFormat | None = None
         pcm = bytearray()
-        async for chunk_format, chunk in self._pcm(texts, options):
+        async for chunk_format, chunk in self._pcm(texts, options, extra):
             fmt = chunk_format
             pcm.extend(chunk)
         if fmt is None:
